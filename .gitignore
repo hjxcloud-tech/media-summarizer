@@ -1,0 +1,13 @@
+# 临时产物（含 B 站 cookies，禁止入库）
+.temp/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行日志与产物
+*.log
+attachments/

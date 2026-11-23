@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+从 Edge/Chrome 浏览器导出 bilibili.com Cookie 为 Netscape 格式
+用于 yt-dlp --cookies 参数，支持浏览器运行时导出
+"""
+
+import os
+import sys
+import json
+import base64
+import sqlite3
+from pathlib import Path
+from datetime import datetime
+
+try:
+    import win32crypt
+except ImportError:
+    print("[ERROR] 需要 pywin32: pip install pywin32", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    HAS_AESGCM = True
+except ImportError:
+    HAS_AESGCM = False
+
+# 浏览器 User Data 候选路径
+BROWSER_PATHS = {
+    "edge": os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                         "Microsoft", "Edge", "User Data"),
+    "chrome": os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                           "Google", "Chrome", "User Data"),
+    "brave": os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                          "BraveSoftware", "Brave-Browser", "User Data"),
+}
+
+
+def find_browser(base: str) -> bool:
+    """Check if a browser's User Data directory exists."""
+    return os.path.isdir(base)
+
+
+def find_profiles(user_data_dir: str) -> list[str]:
+    """Find all profiles with a Cookies database."""
+    profiles = []
+    for entry in os.listdir(user_data_dir):
+        cookie_file = os.path.join(user_data_dir, entry, "Network", "Cookies")
+        if os.path.exists(cookie_file):
+            profiles.append(entry)
+    return profiles
+
+
+def _get_aes_key(user_data_dir: str) -> bytes | None:
+    """Extract the AES-256 key from Local State file.
+
+    Chrome/Edge 130+ encrypts cookies with AES-256-GCM.
+    The key is stored in Local State, encrypted with DPAPI.
+    """
+    if not HAS_AESGCM:
+        return None
+
+    local_state_path = os.path.join(user_data_dir, "Local State")
+    if not os.path.exists(local_state_path):
+        return None
+
+    try:
+        with open(local_state_path, "r", encoding="utf-8") as f:
+            local_state = json.load(f)
+
+        encrypted_key_b64 = local_state.get("os_crypt", {}).get("encrypted_key", "")
+        if not encrypted_key_b64:
+            return None
+
+        # Strip "DPAPI" prefix (5 bytes) then base64 decode
+        encrypted_key = base64.b64decode(encrypted_key_b64)
+        if encrypted_key[:5] != b"DPAPI":
+            return None
+
+        # Decrypt with DPAPI to get the raw AES key
+        key = win32crypt.CryptUnprotectData(
+            encrypted_key[5:], None, None, None, 0
+        )[1]
+        return key
+    except Exception:
+        return None
+
+
+def decrypt_value(encrypted_value: bytes, aes_key: bytes | None = None) -> str:
+    """Decrypt Chrome/Edge encrypted cookie value.
+
+    Handles:
+    - v10 format: AES-256-GCM (nonce=cookie[3:15], ciphertext+tag=cookie[15:])
+    - v20 format: AES-256-GCM (same layout as v10)
+    - Legacy format: DPAPI (CryptUnprotectData)
+    """
+    if not encrypted_value:
+        return ""
+
+    # v10/v20 format: AES-256-GCM
+    if aes_key and (encrypted_value[:3] == b"v10" or encrypted_value[:3] == b"v20"):
+        try:
+            nonce = encrypted_value[3:15]      # 12-byte nonce
+            ciphertext = encrypted_value[15:]  # ciphertext + 16-byte GCM tag
+            aesgcm = AESGCM(aes_key)
+            plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+            return plaintext.decode("utf-8", errors="replace")
+        except Exception:
+            pass
+
+    # Legacy DPAPI fallback
+    try:
+        decrypted = win32crypt.CryptUnprotectData(
+            encrypted_value, None, None, None, 0
+        )
+        return decrypted[1].decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def export_cookies(user_data_dir: str, profile: str,
+                   domain_filter: str, output_path: str) -> int:
+    """Export cookies from browser database to Netscape format.
+
+    Returns number of cookies exported.
+    """
+    cookie_db = os.path.join(user_data_dir, profile, "Network", "Cookies")
+    if not os.path.exists(cookie_db):
+        print(f"[ERROR] Cookie 数据库不存在: {cookie_db}", file=sys.stderr)
+        return 0
+
+    # Extract AES key for v10/v20 cookie format (Chrome/Edge 130+)
+    aes_key = _get_aes_key(user_data_dir)
+    if aes_key:
+        print("[INFO] 检测到 AES-256-GCM 加密 (v10/v20 格式)")
+
+    # Open SQLite DB in immutable readonly mode (works with WAL, no lock needed)
+    db_uri = f"file:{cookie_db}?mode=ro&immutable=1"
+    conn = sqlite3.connect(db_uri, uri=True, timeout=5)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT host_key, name, encrypted_value, path, "
+        "expires_utc, is_secure, is_httponly "
+        "FROM cookies WHERE host_key LIKE ?",
+        (f"%{domain_filter}%",)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        print(f"[WARN] 未找到 {domain_filter} 的 Cookie。请在浏览器中登录。")
+        return 0
+
+    lines = [
+        "# Netscape HTTP Cookie File",
+        "# Generated by video-summarizer cookie exporter",
+        "# " + datetime.now().isoformat(),
+        "",
+    ]
+
+    for host_key, name, enc_val, path, expires_utc, is_secure, is_httponly in rows:
+        value = decrypt_value(enc_val)
+        if not value:
+            continue
+
+        # Netscape format:
+        # domain<TAB>flag<TAB>path<TAB>secure<TAB>expires<TAB>name<TAB>value
+        flag = "TRUE" if host_key.startswith(".") else "FALSE"
+        secure = "TRUE" if is_secure else "FALSE"
+        # Chrome/Edge timestamp (microseconds since 1601-01-01) -> Unix epoch
+        if expires_utc:
+            expires = str(int(expires_utc / 1000000 - 11644473600))
+        else:
+            expires = "0"
+
+        lines.append(
+            f"{host_key}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}"
+        )
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    return len(lines) - 4  # subtract header lines
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="从浏览器导出 bilibili.com Cookie 为 Netscape 格式"
+    )
+    parser.add_argument("--browser", default="edge",
+                        choices=["edge", "chrome", "brave"])
+    parser.add_argument("-d", "--domain", default="bilibili.com")
+    parser.add_argument("-o", "--output", default="cookies.txt")
+    parser.add_argument("--profile", default=None)
+    parser.add_argument("--list-profiles", action="store_true")
+
+    args = parser.parse_args()
+
+    user_data_dir = BROWSER_PATHS.get(args.browser)
+    if not user_data_dir or not find_browser(user_data_dir):
+        print(f"[ERROR] 未找到 {args.browser} 浏览器数据", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[INFO] 浏览器: {args.browser}")
+    print(f"[INFO] User Data: {user_data_dir}")
+
+    profiles = find_profiles(user_data_dir)
+    if not profiles:
+        print("[ERROR] 未找到任何配置文件", file=sys.stderr)
+        sys.exit(1)
+
+    if args.list_profiles:
+        print(f"\n可用配置文件 ({len(profiles)}):")
+        for p in profiles:
+            print(f"  - {p}")
+        sys.exit(0)
+
+    if args.profile:
+        profile = args.profile
+        if profile not in profiles:
+            print(f"[ERROR] 配置文件 '{profile}' 不存在", file=sys.stderr)
+            sys.exit(1)
+    elif "Default" in profiles:
+        profile = "Default"
+    else:
+        profile = profiles[0]
+
+    print(f"[INFO] 配置文件: {profile}")
+
+    count = export_cookies(user_data_dir, profile, args.domain, args.output)
+    if count > 0:
+        print(f"[INFO] 成功导出 {count} 个 Cookie 到: {args.output}")
+    else:
+        print("[ERROR] 未导出任何 Cookie", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

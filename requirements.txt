@@ -1,0 +1,17 @@
+# video-summarizer 依赖清单
+# 安装: pip install -r requirements.txt
+
+# 视频元数据 / 字幕 / 音频 / 评论提取
+yt-dlp>=2024.4.9
+
+# OCR 画面文字识别（extract_frames.py）
+rapidocr-onnxruntime>=1.3.24
+
+# 语音转文本降级（transcribe.py，无字幕时使用）
+faster-whisper>=1.0.0
+
+# ffmpeg 二进制（帧提取用，imageio_ffmpeg 自带 ffmpeg，免系统安装）
+imageio-ffmpeg>=0.4.9
+
+# Windows 浏览器 Cookie 导出（export_cookies.py）
+pywin32>=305; platform_system == "Windows"
